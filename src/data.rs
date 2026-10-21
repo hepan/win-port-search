@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
 use std::ptr;
+use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, GetLastError, HANDLE,
@@ -27,8 +28,8 @@ pub struct DisplayRow {
     pub port: u16,
     pub pid: u32,
     pub count: usize,
-    pub name: String,
-    pub path: String,
+    pub name: Rc<str>,
+    pub path: Rc<str>,
 }
 
 struct OwnedHandle(HANDLE);
@@ -247,34 +248,47 @@ pub fn collect() -> Result<Vec<DisplayRow>, String> {
         None
     };
 
+    // Multiple ports may belong to one process; share its metadata rather than
+    // allocating another copy of the image path for each displayed row.
+    let details: HashMap<u32, (Rc<str>, Rc<str>)> = images
+        .into_iter()
+        .map(|(pid, image)| {
+            let pair = match image {
+                Ok(image) => (
+                    Rc::from(image.rsplit(['\\', '/']).next().unwrap_or(&image)),
+                    Rc::from(image),
+                ),
+                Err(error) => {
+                    let name = match &names {
+                        Some(Ok(names)) => names
+                            .get(&pid)
+                            .map(|name| Rc::from(name.as_str()))
+                            .unwrap_or_else(|| Rc::from("Unknown (process not in snapshot)")),
+                        Some(Err(snapshot_error)) => {
+                            Rc::from(format!("Unknown (snapshot error {snapshot_error})"))
+                        }
+                        None => Rc::from("Unknown (process name unavailable)"),
+                    };
+                    (
+                        name,
+                        Rc::from(format!("Unavailable: Windows error {error}")),
+                    )
+                }
+            };
+            (pid, pair)
+        })
+        .collect();
+    let unknown = (
+        Rc::from("Unknown owner (PID 0)"),
+        Rc::from("Unavailable: no owning process"),
+    );
     Ok(groups
         .into_iter()
         .map(|((protocol, port, pid), count)| {
             let (name, path) = if pid == 0 {
-                (
-                    "Unknown owner (PID 0)".to_owned(),
-                    "Unavailable: no owning process".to_owned(),
-                )
+                unknown.clone()
             } else {
-                match &images[&pid] {
-                    Ok(image) => (
-                        image.rsplit(['\\', '/']).next().unwrap_or(image).to_owned(),
-                        image.clone(),
-                    ),
-                    Err(error) => {
-                        let name = match &names {
-                            Some(Ok(names)) => names
-                                .get(&pid)
-                                .cloned()
-                                .unwrap_or_else(|| "Unknown (process not in snapshot)".to_owned()),
-                            Some(Err(snapshot_error)) => {
-                                format!("Unknown (snapshot error {snapshot_error})")
-                            }
-                            None => "Unknown (process name unavailable)".to_owned(),
-                        };
-                        (name, format!("Unavailable: Windows error {error}"))
-                    }
-                }
+                details[&pid].clone()
             };
             DisplayRow {
                 protocol,

@@ -117,7 +117,14 @@ unsafe fn query(state: *mut State) {
                 let port = row.port.to_string();
                 let pid = row.pid.to_string();
                 let count = row.count.to_string();
-                let cells = [row.protocol, &port, &pid, &row.name, &row.path, &count];
+                let cells = [
+                    row.protocol,
+                    &port,
+                    &pid,
+                    row.name.as_ref(),
+                    row.path.as_ref(),
+                    &count,
+                ];
                 let mut item: LVITEMW = unsafe { zeroed() };
                 item.mask = LVIF_TEXT;
                 item.iItem = displayed as i32;
