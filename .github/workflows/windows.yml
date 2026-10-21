@@ -1,0 +1,47 @@
+name: Windows build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  win7-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly standard-library sources
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: Build Windows 7-compatible x64 target
+        run: cargo +nightly build -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc --release --locked
+      - name: Inspect embedded administrator manifest
+        shell: pwsh
+        run: |
+          $exe = 'target/x86_64-win7-windows-msvc/release/win-port-search.exe'
+          $manifest = Join-Path $env:RUNNER_TEMP 'app.manifest'
+          & mt.exe "-inputresource:${exe};#1" "-out:${manifest}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path $manifest -Pattern 'requireAdministrator' -Quiet)) { throw 'Administrator manifest missing' }
+      - name: Smoke TCP and UDP owner lookup on Windows
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force tests | Out-Null
+          @'
+          #[path = "../src/data.rs"]
+          mod data;
+
+          #[test]
+          fn current_process_owns_bound_tcp_and_udp_ports() {
+              let tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+              let udp = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+              let rows = data::collect().unwrap();
+              let pid = std::process::id();
+              assert!(rows.iter().any(|r|
+                  r.protocol == "TCP" && r.port == tcp.local_addr().unwrap().port() && r.pid == pid
+              ), "bound TCP listener missing");
+              assert!(rows.iter().any(|r|
+                  r.protocol == "UDP" && r.port == udp.local_addr().unwrap().port() && r.pid == pid
+              ), "bound UDP endpoint missing");
+          }
+          '@ | Set-Content -Path tests/smoke.rs -Encoding utf8
+          cargo +nightly test -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc --test smoke --release --locked
