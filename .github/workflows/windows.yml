@@ -17,9 +17,12 @@ jobs:
       - name: Inspect embedded administrator manifest
         shell: pwsh
         run: |
-          $exe = 'target/x86_64-win7-windows-msvc/release/win-port-search.exe'
+          $exe = (Resolve-Path 'target/x86_64-win7-windows-msvc/release/win-port-search.exe').Path
           $manifest = Join-Path $env:RUNNER_TEMP 'app.manifest'
-          & mt.exe "-inputresource:${exe};#1" "-out:${manifest}"
+          $kits = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots').KitsRoot10
+          $mt = Get-ChildItem (Join-Path $kits 'bin\*\x64\mt.exe') | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $mt) { throw 'Windows SDK mt.exe missing' }
+          & $mt.FullName "-inputresource:${exe};#1" "-out:${manifest}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Select-String -Path $manifest -Pattern 'requireAdministrator' -Quiet)) { throw 'Administrator manifest missing' }
       - name: Smoke TCP and UDP owner lookup on Windows
