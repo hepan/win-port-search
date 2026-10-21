@@ -8,5 +8,6 @@ fn main() {
         .canonicalize()
         .unwrap();
     println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg=/MANIFESTUAC:NO");
     println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
 }
