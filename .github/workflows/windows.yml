@@ -98,9 +98,14 @@ jobs:
               Start-Sleep -Milliseconds 250
             }
             if ((Get-Status) -notmatch 'Updated') { throw "Initial query failed: $(Get-Status)" }
-            [void][Gui]::SetWindowText($edit, 'bad-port')
+            if (-not [Gui]::SetWindowText($edit, 'bad-port')) { throw 'Could not set port text' }
             [void][Gui]::SendMessage($search, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
-            if ((Get-Status) -notmatch 'Enter an exact port') { throw 'Invalid search was not rejected' }
+            $afterInvalid = Get-Status
+            if ($afterInvalid -notmatch 'Enter an exact port') {
+              $inputText = [System.Text.StringBuilder]::new(64)
+              [void][Gui]::GetWindowText($edit, $inputText, $inputText.Capacity)
+              throw "Invalid search was not rejected: status=$afterInvalid edit=$inputText"
+            }
             [void][Gui]::SetWindowText($edit, '65535')
             [void][Gui]::SendMessage($search, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
             if ((Get-Status) -notmatch 'port 65535') { throw "Exact search was not applied: $(Get-Status)" }
