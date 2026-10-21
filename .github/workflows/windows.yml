@@ -1,0 +1,123 @@
+name: Windows build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  win7-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly standard-library sources
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: Build Windows 7-compatible x64 target
+        run: cargo +nightly build -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc --release --locked
+      - name: Inspect embedded administrator manifest
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'target/x86_64-win7-windows-msvc/release/win-port-search.exe').Path
+          $manifest = Join-Path $env:RUNNER_TEMP 'app.manifest'
+          $kits = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots').KitsRoot10
+          $mt = Get-ChildItem (Join-Path $kits 'bin\*\x64\mt.exe') | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $mt) { throw 'Windows SDK mt.exe missing' }
+          & $mt.FullName "-inputresource:${exe};#1" "-out:${manifest}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path $manifest -Pattern 'requireAdministrator' -Quiet)) { throw 'Administrator manifest missing' }
+      - name: Smoke TCP and UDP owner lookup on Windows
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force tests | Out-Null
+          @'
+          #[path = "../src/data.rs"]
+          mod data;
+
+          #[test]
+          fn current_process_owns_bound_tcp_and_udp_ports() {
+              let tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+              let udp = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+              let rows = data::collect().unwrap();
+              let pid = std::process::id();
+              assert!(rows.iter().any(|r|
+                  r.protocol == "TCP" && r.port == tcp.local_addr().unwrap().port() && r.pid == pid
+              ), "bound TCP listener missing");
+              assert!(rows.iter().any(|r|
+                  r.protocol == "UDP" && r.port == udp.local_addr().unwrap().port() && r.pid == pid
+              ), "bound UDP endpoint missing");
+          }
+          '@ | Set-Content -Path tests/smoke.rs -Encoding utf8
+          cargo +nightly test -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc --test smoke --release --locked
+      - name: Smoke native GUI search and refresh on Windows
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          @'
+          #[path = "../src/data.rs"]
+          mod data;
+          #[path = "../src/gui.rs"]
+          mod gui;
+
+          use std::ptr::null;
+          use std::thread;
+          use std::time::Duration;
+          use windows_sys::core::w;
+          use windows_sys::Win32::Foundation::HWND;
+          use windows_sys::Win32::UI::WindowsAndMessaging::{
+              FindWindowExW, FindWindowW, GetDlgItem, GetWindowTextLengthW, GetWindowTextW,
+              SendMessageW, SetWindowTextW, WM_CLOSE, WM_COMMAND,
+          };
+
+          fn text(hwnd: HWND) -> String {
+              let mut buffer = vec![0u16; unsafe { GetWindowTextLengthW(hwnd) } as usize + 1];
+              let size = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+              String::from_utf16_lossy(&buffer[..size as usize])
+          }
+
+          #[test]
+          fn search_and_refresh_keep_the_right_filter() {
+              let gui_thread = thread::spawn(|| gui::run().expect("GUI initialization failed"));
+              let mut window = std::ptr::null_mut();
+              for _ in 0..100 {
+                  window = unsafe { FindWindowW(w!("WinPortInspectorMainWindow"), null()) };
+                  if !window.is_null() { break; }
+                  thread::sleep(Duration::from_millis(100));
+              }
+              assert!(!window.is_null(), "GUI window did not open");
+              let first_static = unsafe { FindWindowExW(window, std::ptr::null_mut(), w!("STATIC"), null()) };
+              let status = unsafe { FindWindowExW(window, first_static, w!("STATIC"), null()) };
+              assert!(!status.is_null(), "status control missing");
+              let edit = unsafe { GetDlgItem(window, 104) };
+              let search = unsafe { GetDlgItem(window, 101) };
+              let refresh = unsafe { GetDlgItem(window, 102) };
+              assert!(!edit.is_null() && !search.is_null() && !refresh.is_null(), "search controls missing");
+              for _ in 0..100 {
+                  if text(status).contains("Updated") { break; }
+                  thread::sleep(Duration::from_millis(100));
+              }
+              assert!(text(status).contains("Updated"), "initial query: {}", text(status));
+              unsafe {
+                  assert_ne!(SetWindowTextW(edit, w!("bad-port")), 0);
+                  SendMessageW(window, WM_COMMAND, 101, search as isize);
+              }
+              assert!(text(status).contains("Enter an exact port"), "invalid search: {}", text(status));
+              unsafe {
+                  SetWindowTextW(edit, w!("65535"));
+                  SendMessageW(window, WM_COMMAND, 101, search as isize);
+              }
+              assert!(text(status).contains("port 65535"), "exact search: {}", text(status));
+              unsafe {
+                  SetWindowTextW(edit, w!("1234"));
+                  SendMessageW(window, WM_COMMAND, 102, refresh as isize);
+              }
+              assert!(text(status).contains("port 65535"), "refresh filter: {}", text(status));
+              unsafe {
+                  SetWindowTextW(edit, w!(""));
+                  SendMessageW(window, WM_COMMAND, 101, search as isize);
+              }
+              assert!(text(status).contains("all ports"), "cleared search: {}", text(status));
+              unsafe { SendMessageW(window, WM_CLOSE, 0, 0); }
+              gui_thread.join().expect("GUI thread panicked");
+          }
+          '@ | Set-Content -Path tests/gui_smoke.rs -Encoding utf8
+          cargo +nightly test -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc --test gui_smoke --release --locked
