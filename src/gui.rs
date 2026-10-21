@@ -10,14 +10,16 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::UI::Controls::{
     ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH,
-    LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMW, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS, WC_LISTVIEWW,
+    LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
+    LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMW, LVNI_SELECTED,
+    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS,
+    LVS_SINGLESEL, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, LoadCursorW, MSG, MoveWindow, PostQuitMessage,
+    GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IDYES, LoadCursorW, MB_DEFBUTTON2,
+    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, MessageBoxW, MoveWindow, PostQuitMessage,
     RegisterClassW, SW_SHOWDEFAULT, SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
     TranslateMessage, UnregisterClassW, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE,
     WM_NCDESTROY, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
@@ -30,6 +32,7 @@ const REFRESH_ID: usize = 102;
 const ALL_ID: usize = 103;
 const PORT_EDIT_ID: usize = 104;
 const PORT_LABEL_ID: usize = 105;
+const KILL_ID: usize = 106;
 const COLUMN_WIDTHS: [i32; 6] = [100, 80, 80, 190, 500, 80];
 
 struct State {
@@ -37,6 +40,7 @@ struct State {
     list: HWND,
     status: HWND,
     filter: Option<u16>,
+    rows: Vec<crate::data::DisplayRow>,
     last_result: String,
     creation_error: Option<String>,
     alive: bool,
@@ -49,6 +53,7 @@ impl State {
             list: null_mut(),
             status: null_mut(),
             filter: None,
+            rows: Vec::new(),
             last_result: "No query yet".to_owned(),
             creation_error: None,
             alive: false,
@@ -96,10 +101,11 @@ unsafe fn query(state: *mut State) {
     let list = unsafe { (*state).list };
     unsafe { set_status(state, &format!("Querying {}...", filter_label(filter))) };
 
-    // Discard the previous snapshot even on failure: stale rows must not look
-    // like a successful result for the newly applied filter.
-    let result = crate::data::collect();
+    // Discard the previous snapshot before collection, including on failure:
+    // stale rows must never be actionable for a newly applied filter.
+    unsafe { (*state).rows.clear() };
     unsafe { SendMessageW(list, LVM_DELETEALLITEMS, 0, 0) };
+    let result = crate::data::collect();
     let stamp = clock_time();
     let summary = match result {
         Ok(rows) => {
@@ -107,7 +113,7 @@ unsafe fn query(state: *mut State) {
             let mut text = Vec::new();
             let mut insertion_error = None;
             for row in rows
-                .iter()
+                .into_iter()
                 .filter(|row| filter.map_or(true, |port| row.port == port))
             {
                 if displayed >= i32::MAX as usize {
@@ -155,10 +161,12 @@ unsafe fn query(state: *mut State) {
                 if insertion_error.is_some() {
                     break;
                 }
+                unsafe { (*state).rows.push(row) };
                 displayed += 1;
             }
             match insertion_error {
                 Some(error) => {
+                    unsafe { (*state).rows.clear() };
                     unsafe { SendMessageW(list, LVM_DELETEALLITEMS, 0, 0) };
                     format!(
                         "Query failed at {stamp}: {error}; table cleared ({})",
@@ -217,6 +225,92 @@ unsafe fn search(state: *mut State) {
     }
 }
 
+unsafe fn kill_error(hwnd: HWND, state: *mut State, error: &str) {
+    unsafe { set_status(state, error) };
+    let message = wide(error);
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            message.as_ptr(),
+            w!("Cannot kill process"),
+            MB_OK | MB_ICONERROR,
+        )
+    };
+}
+
+unsafe fn kill_selected(hwnd: HWND, state: *mut State) {
+    let list = unsafe { (*state).list };
+    let selected =
+        unsafe { SendMessageW(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize) };
+    if selected < 0 {
+        unsafe { kill_error(hwnd, state, "Select a process row to kill.") };
+        return;
+    }
+    let Some(row) = (unsafe { (&(*state).rows).get(selected as usize).cloned() }) else {
+        unsafe {
+            kill_error(
+                hwnd,
+                state,
+                "Selected row is no longer available. Refresh the table.",
+            )
+        };
+        return;
+    };
+    if row.pid == 0 || row.pid == 4 || row.pid == std::process::id() {
+        unsafe { kill_error(hwnd, state, "This protected process cannot be killed.") };
+        return;
+    }
+    if row.started_at.is_none() {
+        unsafe {
+            kill_error(
+                hwnd,
+                state,
+                "Process identity is unavailable. Refresh the table.",
+            )
+        };
+        return;
+    }
+
+    let prompt = wide(&format!(
+        "Kill {} (PID {})?\n\nThis kills the entire process, not just the selected port. Unsaved work will be lost.",
+        row.name, row.pid
+    ));
+    if unsafe {
+        MessageBoxW(
+            hwnd,
+            prompt.as_ptr(),
+            w!("Confirm process termination"),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        )
+    } != IDYES
+    {
+        return;
+    }
+    if !unsafe { (*state).alive } {
+        return;
+    }
+    match crate::data::terminate_process(&row) {
+        Ok(()) => {
+            unsafe { query(state) };
+            let summary = format!(
+                "Termination requested for {} (PID {}). {}",
+                row.name,
+                row.pid,
+                unsafe { &(*state).last_result }
+            );
+            unsafe { set_status(state, &summary) };
+            unsafe { (*state).last_result = summary };
+        }
+        Err(error) => unsafe {
+            kill_error(
+                hwnd,
+                state,
+                &format!("Could not kill {} (PID {}): {error}", row.name, row.pid),
+            )
+        },
+    }
+}
+
 unsafe fn layout(hwnd: HWND, state: *mut State) {
     let mut rect: RECT = unsafe { zeroed() };
     if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
@@ -262,6 +356,14 @@ unsafe fn layout(hwnd: HWND, state: *mut State) {
             348,
             10,
             72,
+            25,
+            1,
+        );
+        MoveWindow(
+            windows_sys::Win32::UI::WindowsAndMessaging::GetDlgItem(hwnd, KILL_ID as i32),
+            428,
+            10,
+            110,
             25,
             1,
         );
@@ -369,12 +471,21 @@ unsafe fn create_controls(hwnd: HWND, state: *mut State) -> Result<(), String> {
             0,
             ALL_ID,
         )?;
+        child(
+            hwnd,
+            instance,
+            w!("BUTTON"),
+            w!("Kill process"),
+            WS_TABSTOP,
+            0,
+            KILL_ID,
+        )?;
         let list = child(
             hwnd,
             instance,
             WC_LISTVIEWW,
             w!(""),
-            WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS,
+            WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL,
             WS_EX_CLIENTEDGE,
             0,
         )?;
@@ -454,6 +565,7 @@ unsafe extern "system" fn window_proc(
                     unsafe { SetWindowTextW(edit, w!("")) };
                     unsafe { query(state) };
                 }
+                KILL_ID => unsafe { kill_selected(hwnd, state) },
                 _ => {}
             }
             0

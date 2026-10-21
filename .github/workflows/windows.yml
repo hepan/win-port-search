@@ -45,6 +45,62 @@ jobs:
               assert!(rows.iter().any(|r|
                   r.protocol == "UDP" && r.port == udp.local_addr().unwrap().port() && r.pid == pid
               ), "bound UDP endpoint missing");
+              let own = rows.iter().find(|r|
+                  r.protocol == "TCP" && r.port == tcp.local_addr().unwrap().port() && r.pid == pid
+              ).unwrap();
+              assert!(data::terminate_process(own).is_err(), "must not terminate the inspector");
+          }
+
+          #[test]
+          #[ignore]
+          fn child_listener() {
+              let Some(port_file) = std::env::var_os("WIN_PORT_TEST_PORT_FILE") else { return };
+              let tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+              std::fs::write(port_file, tcp.local_addr().unwrap().port().to_string()).unwrap();
+              loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
+          }
+
+          #[test]
+          fn refuses_stale_pid_and_terminates_disposable_listener() {
+              use std::process::{Command, Stdio};
+              use std::time::Duration;
+              let port_file = std::env::temp_dir().join(format!("win-port-test-{}.port", std::process::id()));
+              let _ = std::fs::remove_file(&port_file);
+              let mut child = Command::new(std::env::current_exe().unwrap())
+                  .args(["--ignored", "--exact", "child_listener", "--nocapture"])
+                  .env("WIN_PORT_TEST_PORT_FILE", &port_file)
+                  .stdout(Stdio::null())
+                  .stderr(Stdio::null())
+                  .spawn().unwrap();
+              let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                  let port = (0..100).find_map(|_| {
+                      let result = std::fs::read_to_string(&port_file).ok()
+                          .and_then(|text| text.parse::<u16>().ok());
+                      if result.is_none() { std::thread::sleep(Duration::from_millis(100)); }
+                      result
+                  }).expect("disposable child did not bind its port");
+                  let rows = data::collect().unwrap();
+                  let row = rows.iter().find(|row|
+                      row.protocol == "TCP" && row.port == port && row.pid == child.id()
+                  ).expect("disposable child listener missing");
+                  let started_at = row.started_at.expect("disposable child identity unavailable");
+                  let mut stale = row.clone();
+                  stale.started_at = Some(started_at.wrapping_add(1));
+                  assert!(data::terminate_process(&stale).is_err(), "stale PID must be refused");
+                  stale.started_at = None;
+                  assert!(data::terminate_process(&stale).is_err(), "unverified PID must be refused");
+                  assert!(child.try_wait().unwrap().is_none(), "stale row killed child");
+                  data::terminate_process(row).expect("could not terminate disposable child");
+                  let exited = (0..100).any(|_| {
+                      if child.try_wait().unwrap().is_some() { true }
+                      else { std::thread::sleep(Duration::from_millis(100)); false }
+                  });
+                  assert!(exited, "disposable child did not exit");
+              }));
+              let _ = child.kill();
+              let _ = child.wait();
+              let _ = std::fs::remove_file(port_file);
+              if let Err(panic) = result { std::panic::resume_unwind(panic); }
           }
           '@ | Set-Content -Path tests/smoke.rs -Encoding utf8
           cargo +nightly test -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc --test smoke --release --locked
@@ -61,11 +117,15 @@ jobs:
           use std::ptr::null;
           use std::thread;
           use std::time::Duration;
+          use std::process::{Command, Stdio};
+          use windows_sys::Win32::UI::Controls::{
+              LVIS_SELECTED, LVITEMW, LVM_GETITEMCOUNT, LVM_GETITEMTEXTW, LVM_SETITEMSTATE,
+          };
           use windows_sys::core::w;
           use windows_sys::Win32::Foundation::HWND;
           use windows_sys::Win32::UI::WindowsAndMessaging::{
               FindWindowExW, FindWindowW, GetDlgItem, GetWindowTextLengthW, GetWindowTextW,
-              SendMessageW, SetWindowTextW, WM_CLOSE, WM_COMMAND,
+              SendMessageW, SetWindowTextW, BM_CLICK, WM_CLOSE, WM_COMMAND,
           };
 
           fn text(hwnd: HWND) -> String {
@@ -128,8 +188,104 @@ jobs:
               unsafe { SendMessageW(window, WM_CLOSE, 0, 0); }
               gui_thread.join().expect("GUI thread panicked");
           }
+          #[test]
+          #[ignore]
+          fn gui_child_listener() {
+              let Some(port_file) = std::env::var_os("WIN_PORT_GUI_TEST_PORT_FILE") else { return };
+              let tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+              std::fs::write(port_file, tcp.local_addr().unwrap().port().to_string()).unwrap();
+              loop { thread::sleep(Duration::from_secs(1)); }
+          }
+
+          #[test]
+          fn selecting_and_confirming_kills_only_disposable_child() {
+              let port_file = std::env::temp_dir().join(format!("win-port-gui-test-{}.port", std::process::id()));
+              let _ = std::fs::remove_file(&port_file);
+              let mut child = Command::new(std::env::current_exe().unwrap())
+                  .args(["--ignored", "--exact", "gui_child_listener", "--nocapture"])
+                  .env("WIN_PORT_GUI_TEST_PORT_FILE", &port_file)
+                  .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+              let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                  let port = (0..100).find_map(|_| {
+                      let found = std::fs::read_to_string(&port_file).ok()
+                          .and_then(|value| value.parse::<u16>().ok());
+                      if found.is_none() { thread::sleep(Duration::from_millis(100)); }
+                      found
+                  }).expect("disposable GUI child did not bind a port");
+                  let gui_thread = thread::spawn(|| gui::run().expect("GUI initialization failed"));
+                  let mut window = std::ptr::null_mut();
+                  for _ in 0..100 {
+                      window = unsafe { FindWindowW(w!("WinPortInspectorMainWindow"), null()) };
+                      if !window.is_null() { break; }
+                      thread::sleep(Duration::from_millis(100));
+                  }
+                  assert!(!window.is_null(), "GUI window did not open");
+                  let edit = unsafe { GetDlgItem(window, 104) };
+                  let search = unsafe { GetDlgItem(window, 101) };
+                  let kill = unsafe { GetDlgItem(window, 106) };
+                  let list = unsafe { FindWindowExW(window, std::ptr::null_mut(), w!("SysListView32"), null()) };
+                  assert!(!edit.is_null() && !search.is_null() && !kill.is_null() && !list.is_null());
+                  let port_utf16 = port.to_string().encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+                  unsafe {
+                      assert_ne!(SetWindowTextW(edit, port_utf16.as_ptr()), 0);
+                      SendMessageW(window, WM_COMMAND, 101, search as isize);
+                  }
+                  assert_eq!(unsafe { SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) }, 1);
+                  let mut pid_text = [0u16; 16];
+                  let mut item = LVITEMW::default();
+                  item.iSubItem = 2;
+                  item.pszText = pid_text.as_mut_ptr();
+                  item.cchTextMax = pid_text.len() as i32;
+                  unsafe { SendMessageW(list, LVM_GETITEMTEXTW, 0, &mut item as *mut _ as isize) };
+                  let length = pid_text.iter().position(|&ch| ch == 0).unwrap();
+                  assert_eq!(String::from_utf16_lossy(&pid_text[..length]), child.id().to_string(),
+                      "selected row must belong to the disposable child");
+                  let mut selection = LVITEMW::default();
+                  selection.stateMask = LVIS_SELECTED;
+                  selection.state = LVIS_SELECTED;
+                  unsafe { SendMessageW(list, LVM_SETITEMSTATE, 0, &selection as *const _ as isize) };
+                  let hwnd = window as usize;
+                  let button = kill as usize;
+                  let click = thread::spawn(move || unsafe {
+                      SendMessageW(hwnd as HWND, WM_COMMAND, 106, button as isize)
+                  });
+                  let mut prompt = std::ptr::null_mut();
+                  for _ in 0..100 {
+                      prompt = unsafe { FindWindowW(w!("#32770"), w!("Confirm process termination")) };
+                      if !prompt.is_null() { break; }
+                      thread::sleep(Duration::from_millis(100));
+                  }
+                  assert!(!prompt.is_null(), "kill confirmation did not appear");
+                  let mut label = std::ptr::null_mut();
+                  let mut identifies_child = false;
+                  loop {
+                      label = unsafe { FindWindowExW(prompt, label, w!("STATIC"), null()) };
+                      if label.is_null() { break; }
+                      if text(label).contains(&format!("PID {}", child.id())) {
+                          identifies_child = true;
+                          break;
+                      }
+                  }
+                  assert!(identifies_child, "confirmation must identify the selected PID");
+                  let yes = unsafe { GetDlgItem(prompt, 6) };
+                  assert!(!yes.is_null(), "confirmation Yes button missing");
+                  unsafe { SendMessageW(yes, BM_CLICK, 0, 0) };
+                  click.join().unwrap();
+                  let exited = (0..100).any(|_| {
+                      if child.try_wait().unwrap().is_some() { true }
+                      else { thread::sleep(Duration::from_millis(100)); false }
+                  });
+                  assert!(exited, "GUI did not terminate disposable child");
+                  unsafe { SendMessageW(window, WM_CLOSE, 0, 0) };
+                  gui_thread.join().expect("GUI thread panicked");
+              }));
+              let _ = child.kill();
+              let _ = child.wait();
+              let _ = std::fs::remove_file(port_file);
+              if let Err(panic) = result { std::panic::resume_unwind(panic); }
+          }
           '@ | Set-Content -Path tests/gui_smoke.rs -Encoding utf8
-          cargo +nightly test -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc --test gui_smoke --release --locked
+          cargo +nightly test -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc --test gui_smoke --release --locked -- --test-threads=1
       - name: Record executable SHA-256
         shell: pwsh
         run: |
