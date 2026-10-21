@@ -130,3 +130,18 @@ jobs:
           }
           '@ | Set-Content -Path tests/gui_smoke.rs -Encoding utf8
           cargo +nightly test -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc --test gui_smoke --release --locked
+      - name: Record executable SHA-256
+        shell: pwsh
+        run: |
+          $folder = 'target/x86_64-win7-windows-msvc/release'
+          $hash = (Get-FileHash (Join-Path $folder 'win-port-search.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  win-port-search.exe" | Set-Content (Join-Path $folder 'win-port-search.sha256') -Encoding ascii
+      - name: Upload x64 executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-port-search-win7-x64
+          path: |
+            target/x86_64-win7-windows-msvc/release/win-port-search.exe
+            target/x86_64-win7-windows-msvc/release/win-port-search.sha256
+          if-no-files-found: error
+          retention-days: 30
