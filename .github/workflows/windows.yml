@@ -99,7 +99,7 @@ jobs:
             }
             if ((Get-Status) -notmatch 'Updated') { throw "Initial query failed: $(Get-Status)" }
             if (-not [Gui]::SetWindowText($edit, 'bad-port')) { throw 'Could not set port text' }
-            [void][Gui]::SendMessage($search, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+            [void][Gui]::SendMessage($window, 0x0111, [IntPtr]101, $search)
             $afterInvalid = Get-Status
             if ($afterInvalid -notmatch 'Enter an exact port') {
               $inputText = [System.Text.StringBuilder]::new(64)
@@ -107,10 +107,10 @@ jobs:
               throw "Invalid search was not rejected: status=$afterInvalid edit=$inputText"
             }
             [void][Gui]::SetWindowText($edit, '65535')
-            [void][Gui]::SendMessage($search, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+            [void][Gui]::SendMessage($window, 0x0111, [IntPtr]101, $search)
             if ((Get-Status) -notmatch 'port 65535') { throw "Exact search was not applied: $(Get-Status)" }
             [void][Gui]::SetWindowText($edit, '1234')
-            [void][Gui]::SendMessage($refresh, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+            [void][Gui]::SendMessage($window, 0x0111, [IntPtr]102, $refresh)
             if ((Get-Status) -notmatch 'port 65535') { throw "Refresh lost the applied filter: $(Get-Status)" }
           }
           finally {
