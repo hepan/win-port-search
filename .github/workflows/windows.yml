@@ -84,13 +84,22 @@ jobs:
                   thread::sleep(Duration::from_millis(100));
               }
               assert!(!window.is_null(), "GUI window did not open");
-              let first_static = unsafe { FindWindowExW(window, std::ptr::null_mut(), w!("STATIC"), null()) };
-              let status = unsafe { FindWindowExW(window, first_static, w!("STATIC"), null()) };
-              assert!(!status.is_null(), "status control missing");
-              let edit = unsafe { GetDlgItem(window, 104) };
-              let search = unsafe { GetDlgItem(window, 101) };
-              let refresh = unsafe { GetDlgItem(window, 102) };
-              assert!(!edit.is_null() && !search.is_null() && !refresh.is_null(), "search controls missing");
+              let mut controls = None;
+              for _ in 0..100 {
+                  let first_static = unsafe { FindWindowExW(window, std::ptr::null_mut(), w!("STATIC"), null()) };
+                  if !first_static.is_null() {
+                      let status = unsafe { FindWindowExW(window, first_static, w!("STATIC"), null()) };
+                      let edit = unsafe { GetDlgItem(window, 104) };
+                      let search = unsafe { GetDlgItem(window, 101) };
+                      let refresh = unsafe { GetDlgItem(window, 102) };
+                      if !status.is_null() && !edit.is_null() && !search.is_null() && !refresh.is_null() {
+                          controls = Some((status, edit, search, refresh));
+                          break;
+                      }
+                  }
+                  thread::sleep(Duration::from_millis(100));
+              }
+              let (status, edit, search, refresh) = controls.expect("GUI controls did not finish opening");
               for _ in 0..100 {
                   if text(status).contains("Updated") { break; }
                   thread::sleep(Duration::from_millis(100));
