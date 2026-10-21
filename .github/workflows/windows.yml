@@ -256,7 +256,17 @@ jobs:
                       thread::sleep(Duration::from_millis(100));
                   }
                   assert!(!prompt.is_null(), "kill confirmation did not appear");
-                  assert!(text(prompt).contains(&format!("PID {}", child.id())));
+                  let mut label = std::ptr::null_mut();
+                  let mut identifies_child = false;
+                  loop {
+                      label = unsafe { FindWindowExW(prompt, label, w!("STATIC"), null()) };
+                      if label.is_null() { break; }
+                      if text(label).contains(&format!("PID {}", child.id())) {
+                          identifies_child = true;
+                          break;
+                      }
+                  }
+                  assert!(identifies_child, "confirmation must identify the selected PID");
                   let yes = unsafe { GetDlgItem(prompt, 6) };
                   assert!(!yes.is_null(), "confirmation Yes button missing");
                   unsafe { SendMessageW(yes, BM_CLICK, 0, 0) };
