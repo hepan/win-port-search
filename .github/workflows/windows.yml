@@ -48,71 +48,76 @@ jobs:
           }
           '@ | Set-Content -Path tests/smoke.rs -Encoding utf8
           cargo +nightly test -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc --test smoke --release --locked
-      - name: Smoke GUI search and refresh on Windows
+      - name: Smoke native GUI search and refresh on Windows
         timeout-minutes: 2
         shell: pwsh
         run: |
-          Add-Type @'
-          using System;
-          using System.Text;
-          using System.Runtime.InteropServices;
-          public static class Gui {
-              public delegate bool ChildCallback(IntPtr hwnd, IntPtr data);
-              [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr parent, int id);
-              [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool SetWindowText(IntPtr hwnd, string text);
-              [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hwnd, uint message, IntPtr wparam, IntPtr lparam);
-              [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int length);
-              [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, ChildCallback callback, IntPtr data);
+          @'
+          #[path = "../src/data.rs"]
+          mod data;
+          #[path = "../src/gui.rs"]
+          mod gui;
+
+          use std::ptr::null;
+          use std::thread;
+          use std::time::Duration;
+          use windows_sys::core::w;
+          use windows_sys::Win32::Foundation::HWND;
+          use windows_sys::Win32::UI::WindowsAndMessaging::{
+              FindWindowExW, FindWindowW, GetDlgItem, GetWindowTextLengthW, GetWindowTextW,
+              SendMessageW, SetWindowTextW, WM_CLOSE, WM_COMMAND,
+          };
+
+          fn text(hwnd: HWND) -> String {
+              let mut buffer = vec![0u16; unsafe { GetWindowTextLengthW(hwnd) } as usize + 1];
+              let size = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+              String::from_utf16_lossy(&buffer[..size as usize])
           }
-          '@
-          $exe = (Resolve-Path 'target/x86_64-win7-windows-msvc/release/win-port-search.exe').Path
-          $process = Start-Process -FilePath $exe -PassThru
-          try {
-            $window = [IntPtr]::Zero
-            for ($i = 0; $i -lt 40; $i++) {
-              Start-Sleep -Milliseconds 250
-              $process.Refresh()
-              $window = $process.MainWindowHandle
-              if ($window -ne [IntPtr]::Zero) { break }
-              if ($process.HasExited) { throw 'GUI exited before displaying a window' }
-            }
-            if ($window -eq [IntPtr]::Zero) { throw 'GUI window did not open' }
-            $edit = [Gui]::GetDlgItem($window, 104)
-            $search = [Gui]::GetDlgItem($window, 101)
-            $refresh = [Gui]::GetDlgItem($window, 102)
-            if ($edit -eq [IntPtr]::Zero -or $search -eq [IntPtr]::Zero -or $refresh -eq [IntPtr]::Zero) { throw 'Search controls missing' }
-            function Get-Status {
-              $script:status = ''
-              $callback = [Gui+ChildCallback]{
-                param($child, $unused)
-                $text = [System.Text.StringBuilder]::new(2048)
-                [void][Gui]::GetWindowText($child, $text, $text.Capacity)
-                if ($text.ToString() -match 'Updated|Query failed|Enter an exact port') { $script:status = $text.ToString() }
-                return $true
+
+          #[test]
+          fn search_and_refresh_keep_the_right_filter() {
+              let gui_thread = thread::spawn(|| gui::run().expect("GUI initialization failed"));
+              let mut window = std::ptr::null_mut();
+              for _ in 0..100 {
+                  window = unsafe { FindWindowW(w!("WinPortInspectorMainWindow"), null()) };
+                  if !window.is_null() { break; }
+                  thread::sleep(Duration::from_millis(100));
               }
-              [void][Gui]::EnumChildWindows($window, $callback, [IntPtr]::Zero)
-              return $script:status
-            }
-            for ($i = 0; $i -lt 40; $i++) {
-              if ((Get-Status) -match 'Updated') { break }
-              Start-Sleep -Milliseconds 250
-            }
-            if ((Get-Status) -notmatch 'Updated') { throw "Initial query failed: $(Get-Status)" }
-            if (-not [Gui]::SetWindowText($edit, 'bad-port')) { throw 'Could not set port text' }
-            [void][Gui]::SendMessage($window, 0x0111, [IntPtr]101, $search)
-            $afterInvalid = Get-Status
-            if ($afterInvalid -notmatch 'Enter an exact port') {
-              $inputText = [System.Text.StringBuilder]::new(64)
-              [void][Gui]::GetWindowText($edit, $inputText, $inputText.Capacity)
-              throw "Invalid search was not rejected: status=$afterInvalid edit=$inputText"
-            }
-            [void][Gui]::SetWindowText($edit, '65535')
-            [void][Gui]::SendMessage($window, 0x0111, [IntPtr]101, $search)
-            if ((Get-Status) -notmatch 'port 65535') { throw "Exact search was not applied: $(Get-Status)" }
-            [void][Gui]::SetWindowText($edit, '1234')
-            [void][Gui]::SendMessage($window, 0x0111, [IntPtr]102, $refresh)
-            if ((Get-Status) -notmatch 'port 65535') { throw "Refresh lost the applied filter: $(Get-Status)" }
+              assert!(!window.is_null(), "GUI window did not open");
+              let first_static = unsafe { FindWindowExW(window, std::ptr::null_mut(), w!("STATIC"), null()) };
+              let status = unsafe { FindWindowExW(window, first_static, w!("STATIC"), null()) };
+              assert!(!status.is_null(), "status control missing");
+              let edit = unsafe { GetDlgItem(window, 104) };
+              let search = unsafe { GetDlgItem(window, 101) };
+              let refresh = unsafe { GetDlgItem(window, 102) };
+              assert!(!edit.is_null() && !search.is_null() && !refresh.is_null(), "search controls missing");
+              for _ in 0..100 {
+                  if text(status).contains("Updated") { break; }
+                  thread::sleep(Duration::from_millis(100));
+              }
+              assert!(text(status).contains("Updated"), "initial query: {}", text(status));
+              unsafe {
+                  assert_ne!(SetWindowTextW(edit, w!("bad-port")), 0);
+                  SendMessageW(window, WM_COMMAND, 101, search as isize);
+              }
+              assert!(text(status).contains("Enter an exact port"), "invalid search: {}", text(status));
+              unsafe {
+                  SetWindowTextW(edit, w!("65535"));
+                  SendMessageW(window, WM_COMMAND, 101, search as isize);
+              }
+              assert!(text(status).contains("port 65535"), "exact search: {}", text(status));
+              unsafe {
+                  SetWindowTextW(edit, w!("1234"));
+                  SendMessageW(window, WM_COMMAND, 102, refresh as isize);
+              }
+              assert!(text(status).contains("port 65535"), "refresh filter: {}", text(status));
+              unsafe {
+                  SetWindowTextW(edit, w!(""));
+                  SendMessageW(window, WM_COMMAND, 101, search as isize);
+              }
+              assert!(text(status).contains("all ports"), "cleared search: {}", text(status));
+              unsafe { SendMessageW(window, WM_CLOSE, 0, 0); }
+              gui_thread.join().expect("GUI thread panicked");
           }
-          finally {
-            if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
-          }
+          '@ | Set-Content -Path tests/gui_smoke.rs -Encoding utf8
+          cargo +nightly test -Z build-std=std,panic_abort --target x86_64-win7-windows-msvc --test gui_smoke --release --locked
