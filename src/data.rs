@@ -5,7 +5,7 @@ use std::ptr;
 use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, GetLastError, HANDLE,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, FILETIME, GetLastError, HANDLE,
     INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -19,7 +19,9 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    GetCurrentProcessId, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
+    TerminateProcess,
 };
 
 #[derive(Clone)]
@@ -28,6 +30,7 @@ pub struct DisplayRow {
     pub port: u16,
     pub pid: u32,
     pub count: usize,
+    pub started_at: Option<u64>,
     pub name: Rc<str>,
     pub path: Rc<str>,
 }
@@ -133,12 +136,24 @@ fn add_rows<Row>(
     Ok(())
 }
 
-fn process_image_path(pid: u32) -> Result<String, u32> {
-    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if raw.is_null() {
+fn creation_time(handle: HANDLE) -> Result<u64, u32> {
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    if unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
         return Err(unsafe { GetLastError() });
     }
+    Ok(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+}
+
+fn process_metadata(pid: u32) -> (Result<String, u32>, Option<u64>) {
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        return (Err(unsafe { GetLastError() }), None);
+    }
     let handle = OwnedHandle(raw);
+    let started_at = creation_time(handle.0).ok();
     let mut buffer = vec![0u16; 260];
     loop {
         let mut size = buffer.len() as u32;
@@ -146,11 +161,14 @@ fn process_image_path(pid: u32) -> Result<String, u32> {
             QueryFullProcessImageNameW(handle.0, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut size)
         } != 0
         {
-            return Ok(String::from_utf16_lossy(&buffer[..size as usize]));
+            return (
+                Ok(String::from_utf16_lossy(&buffer[..size as usize])),
+                started_at,
+            );
         }
         let error = unsafe { GetLastError() };
         if error != ERROR_INSUFFICIENT_BUFFER || buffer.len() >= 32_768 {
-            return Err(error);
+            return (Err(error), started_at);
         }
         buffer.resize((buffer.len() * 2).min(32_768), 0);
     }
@@ -234,15 +252,15 @@ pub fn collect() -> Result<Vec<DisplayRow>, String> {
         &mut groups,
     )?;
 
-    // Ask for the full path once per distinct PID. A single process snapshot provides
-    // filenames for processes whose image path cannot be queried (including protected ones).
-    let mut images = HashMap::<u32, Result<String, u32>>::new();
+    // Query creation time and image path on one handle per PID. A single process
+    // snapshot provides filenames when the image path cannot be queried.
+    let mut images = HashMap::<u32, (Result<String, u32>, Option<u64>)>::new();
     for &(_, _, pid) in groups.keys() {
         if pid != 0 {
-            images.entry(pid).or_insert_with(|| process_image_path(pid));
+            images.entry(pid).or_insert_with(|| process_metadata(pid));
         }
     }
-    let names = if images.values().any(Result::is_err) {
+    let names = if images.values().any(|(image, _)| image.is_err()) {
         Some(snapshot_process_names())
     } else {
         None
@@ -250,9 +268,9 @@ pub fn collect() -> Result<Vec<DisplayRow>, String> {
 
     // Multiple ports may belong to one process; share its metadata rather than
     // allocating another copy of the image path for each displayed row.
-    let details: HashMap<u32, (Rc<str>, Rc<str>)> = images
+    let details: HashMap<u32, (Rc<str>, Rc<str>, Option<u64>)> = images
         .into_iter()
-        .map(|(pid, image)| {
+        .map(|(pid, (image, started_at))| {
             let pair = match image {
                 Ok(image) => (
                     Rc::from(image.rsplit(['\\', '/']).next().unwrap_or(&image)),
@@ -275,17 +293,18 @@ pub fn collect() -> Result<Vec<DisplayRow>, String> {
                     )
                 }
             };
-            (pid, pair)
+            (pid, (pair.0, pair.1, started_at))
         })
         .collect();
     let unknown = (
         Rc::from("Unknown owner (PID 0)"),
         Rc::from("Unavailable: no owning process"),
+        None,
     );
     Ok(groups
         .into_iter()
         .map(|((protocol, port, pid), count)| {
-            let (name, path) = if pid == 0 {
+            let (name, path, started_at) = if pid == 0 {
                 unknown.clone()
             } else {
                 details[&pid].clone()
@@ -295,9 +314,57 @@ pub fn collect() -> Result<Vec<DisplayRow>, String> {
                 port,
                 pid,
                 count,
+                started_at,
                 name,
                 path,
             }
         })
         .collect())
+}
+
+pub fn terminate_process(row: &DisplayRow) -> Result<(), String> {
+    if row.pid == 0 || row.pid == 4 {
+        return Err(format!("PID {} is a protected system process", row.pid));
+    }
+    if row.pid == unsafe { GetCurrentProcessId() } {
+        return Err("Cannot terminate the port inspector itself".to_string());
+    }
+    let expected = row
+        .started_at
+        .ok_or_else(|| format!("Cannot verify the identity of PID {}", row.pid))?;
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            row.pid,
+        )
+    };
+    if raw.is_null() {
+        return Err(format!(
+            "Cannot open PID {} for termination: Windows error {}",
+            row.pid,
+            unsafe { GetLastError() }
+        ));
+    }
+    let handle = OwnedHandle(raw);
+    let actual = creation_time(handle.0).map_err(|error| {
+        format!(
+            "Cannot verify the identity of PID {}: Windows error {error}",
+            row.pid
+        )
+    })?;
+    if actual != expected {
+        return Err(format!(
+            "PID {} now belongs to a different process; refresh the list",
+            row.pid
+        ));
+    }
+    if unsafe { TerminateProcess(handle.0, 1) } == 0 {
+        return Err(format!(
+            "Cannot terminate PID {}: Windows error {}",
+            row.pid,
+            unsafe { GetLastError() }
+        ));
+    }
+    Ok(())
 }
